@@ -25,33 +25,54 @@ client = OpenAI(
     base_url="https://api.deepseek.com",
 )
 
-
-response = client.chat.completions.create(
-    model="deepseek-chat",
-    messages=[
-        {
-            "role": "system",
-            "content": (
-                "你是一名交通工程分析助手。"
-                "请根据用户提供的交通运行指标进行简洁、客观的分析。"
-            ),
-        },
-        {
-            "role": "user",
-            "content": """
+def analyze_traffic_state(
+    queue: float,
+    waiting_time: float,
+    throughput: int,
+    completion_rate: float,
+) -> str:
+    #role角色，content内容，messages是一个列表，包含system和user，system主要告诉模型你是谁，你的工作规则是什么；user告诉模型当前这一次具体让它干什么
+    #system岗位说明书，user当前任务
+    user_prompt = f"""
 某交叉口当前交通运行指标如下：
 
-平均排队长度：32.5
-平均等待时间：88.2 秒
-通过量：1171 辆
-车辆完成率：0.888
+平均排队长度：{queue}米
+平均等待时间：{waiting_time} 秒
+通过量：{throughput} 辆
+车辆完成率：{completion_rate}
 
 请分析当前交通运行状态。
-""",
-        },
-    ],
-    stream=False,
-)
+"""
 
+    response = client.chat.completions.create(
+        model="deepseek-v4-flash",
+        messages=[
+            {
+                "role": "system",
+                "content": (
+                    "你是一名交通工程分析助手。"
+                    "请根据用户提供的数据进行客观分析，"
+                    "不要编造不存在的数据。"
+                ),
+            },
+            {
+                "role": "user",
+                "content": user_prompt,
+            },
+        ],
+        stream=False,
+    )
 
-print(response.choices[0].message.content)
+    return response.choices[0].message.content
+
+if __name__ == "__main__":
+
+    result = analyze_traffic_state(
+        queue=55,
+        waiting_time=160,
+        throughput=900,
+        completion_rate=0.70,
+    )
+
+print("\n===== Traffic Analysis =====")
+print(result)
