@@ -23,11 +23,14 @@
 
 - [x] DeepSeek API 基础调用
 - [x] JSON Output
-- [ ] Input Validation
-- [ ] Tool Calling
+- [x] Input Validation
+- [x] Tool Calling
 - [ ] Agent Loop
 - [ ] SUMO Integration
 - [ ] RAG
 - [ ] LangGraph
 - [ ] MCP
 - [ ] Agent Evaluation
+
+## 笔记
+LLM 负责理解和决策，Tool 负责执行，Agent Runtime 负责连接和控制两者
