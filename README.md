@@ -25,7 +25,7 @@
 - [x] JSON Output
 - [x] Input Validation
 - [x] Tool Calling
-- [ ] Agent Loop
+- [x] Agent Loop
 - [ ] SUMO Integration
 - [ ] RAG
 - [ ] LangGraph
@@ -33,4 +33,4 @@
 - [ ] Agent Evaluation
 
 ## 笔记
-LLM 负责理解和决策，Tool 负责执行，Agent Runtime 负责连接和控制两者
+LLM负责理解、决策和工具选择；Agent Runtime负责循环、校验、异常处理和执行控制；Tools负责真正完成确定性的外部任务。
