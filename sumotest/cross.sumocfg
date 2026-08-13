@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<configuration>
+    <input>
+        <net-file value="cross.net.xml" />
+        <route-files value="cross.rou.xml" />
+    </input>
+    <time>
+        <begin value="0" />
+        <end value="300" />
+    </time>
+    <processing>
+        <time-to-teleport value="120" />
+    </processing>
+    <report>
+        <verbose value="true" />
+        <duration-log.disable value="true" />
+    </report>
+</configuration>
