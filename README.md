@@ -34,3 +34,7 @@
 
 ## 笔记
 LLM负责理解、决策和工具选择；Agent Runtime负责循环、校验、异常处理和执行控制；Tools负责真正完成确定性的外部任务。
+- LLM负责理解与决策，Python负责确定性执行与计算。
+- 多 seed 统计不能依赖 LLM 心算，应由 Python 计算。
+- 固定、重复、确定的过程应该封装成 Workflow。
+- 下一步是否执行、执行哪个 Workflow，才适合交给 Agent 决策。
