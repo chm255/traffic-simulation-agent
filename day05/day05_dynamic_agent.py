@@ -28,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:
 
 
 # ============================================================
-# 2. 导入 Day 5 Batch Runner
+# 2. 导入已经通过的 Batch Runner
 # ============================================================
 
 from day05.day05_batch_runner import (
@@ -37,7 +37,7 @@ from day05.day05_batch_runner import (
 
 
 # ============================================================
-# 3. 场景
+# 3. 当前支持场景
 # ============================================================
 
 SUPPORTED_SCENARIOS = {
@@ -46,7 +46,7 @@ SUPPORTED_SCENARIOS = {
 
 
 # ============================================================
-# 4. 当前项目指标定义
+# 4. 项目指标定义
 # ============================================================
 
 METRIC_DEFINITIONS = {
@@ -69,7 +69,8 @@ METRIC_DEFINITIONS = {
     "mean_vehicle_waiting_time": (
         "记录观察窗口内所有曾出现在监测进口车道上的车辆，"
         "累计每辆车在监测进口车道内处于等待状态的时间，"
-        "然后将总累计等待时间除以 observed_vehicle_count。"
+        "然后将所有车辆累计等待时间求和，"
+        "除以 observed_vehicle_count。"
         "包括仿真结束时尚未完成行程的车辆。"
         "单位为 s/veh。"
     ),
@@ -114,7 +115,20 @@ client = OpenAI(
 
 
 # ============================================================
-# 6. Batch Tool Schema
+# 6. Tool Schema
+#
+# 注意：
+#
+# Tool 本身仍然只是：
+#
+# run_batch_sumo_experiment(
+#     scenario,
+#     seeds,
+#     duration,
+# )
+#
+# initial / extra 的概念属于 Agent Task，
+# 而不是 Batch Tool 本身。
 # ============================================================
 
 TOOLS = [
@@ -129,12 +143,12 @@ TOOLS = [
 
             "description": (
                 "针对同一个 SUMO 场景，"
-                "使用多个用户明确提供的随机种子"
-                "运行多次真实 SUMO 仿真实验，"
-                "并由 Python 自动汇总每个 seed 的结果，"
-                "计算 mean、sample std、min 和 max。"
-                "当用户要求运行多个 seeds、"
-                "批量实验、稳定性分析或重复实验时使用。"
+                "使用一组用户明确批准的随机种子"
+                "运行多次真实 SUMO 实验，"
+                "并由 Python 自动计算"
+                "mean、sample std、min 和 max。"
+                "动态实验中，每次调用只能执行"
+                "当前阶段允许的一组 seeds。"
             ),
 
             "parameters": {
@@ -142,10 +156,6 @@ TOOLS = [
                 "type": "object",
 
                 "properties": {
-
-                    # ========================================
-                    # scenario
-                    # ========================================
 
                     "scenario": {
 
@@ -162,10 +172,6 @@ TOOLS = [
                     },
 
 
-                    # ========================================
-                    # seeds
-                    # ========================================
-
                     "seeds": {
 
                         "type": "array",
@@ -175,25 +181,21 @@ TOOLS = [
                         },
 
                         "description": (
-                            "需要运行的随机种子列表。"
-                            "每个 seed 必须由用户明确提供，"
-                            "不得由模型自行补充或生成。"
-                            "例如 [42, 43, 44]。"
+                            "本轮 Batch Experiment "
+                            "需要执行的随机种子列表。"
+                            "必须来自用户明确批准的 seed 组，"
+                            "不得自行创建、增加、删除或修改。"
                         ),
                     },
 
-
-                    # ========================================
-                    # duration
-                    # ========================================
 
                     "duration": {
 
                         "type": "integer",
 
                         "description": (
-                            "每一个 seed 对应的"
-                            "SUMO 仿真时长，单位秒。"
+                            "本轮每个 seed 的仿真时长，"
+                            "单位为秒。"
                         ),
                     },
                 },
@@ -218,87 +220,70 @@ TOOL_MAP = {}
 
 
 # ============================================================
-# 8. 从用户输入提取 seeds
+# 8. 提取指定名称的 seed group
 #
-# 当前教学版本支持：
+# 支持：
 #
-# seeds=42,43,44
-# seeds 42、43、44
-# seed 42, 43, 44
-# 随机种子 42、43、44
+# initial_seeds=42、43、44
+# extra_seeds=45、46、47
 #
-# 暂时不支持：
-#
-# seeds=42-44
 # ============================================================
 
-def extract_seeds_from_user_query(
+def extract_named_seed_group(
     user_query: str,
+    group_name: str,
 ) -> list[int] | None:
 
-    patterns = [
+    pattern = (
+        rf"{re.escape(group_name)}"
+        r"\s*"
+        r"(?:=|:|为|是)?"
+        r"\s*"
+        r"([-0-9,\s、，]+)"
+    )
 
-        (
-            r"(?:seeds?|随机种子|种子)"
-            r"\s*"
-            r"(?:=|:|为|是|使用)?"
-            r"\s*"
-            r"([-0-9,\s、，]+)"
-        ),
+
+    match = re.search(
+        pattern,
+        user_query,
+        re.IGNORECASE,
+    )
+
+
+    if not match:
+
+        return None
+
+
+    seed_text = (
+        match.group(1)
+    )
+
+
+    seed_strings = (
+        re.findall(
+            r"-?\d+",
+            seed_text,
+        )
+    )
+
+
+    if not seed_strings:
+
+        return None
+
+
+    return [
+
+        int(value)
+
+        for value
+        in seed_strings
     ]
 
 
-    for pattern in patterns:
-
-        match = re.search(
-            pattern,
-            user_query,
-            re.IGNORECASE,
-        )
-
-
-        if not match:
-
-            continue
-
-
-        seed_text = (
-            match.group(1)
-        )
-
-
-        seed_strings = (
-            re.findall(
-                r"-?\d+",
-                seed_text,
-            )
-        )
-
-
-        if not seed_strings:
-
-            continue
-
-
-        return [
-            int(value)
-            for value
-            in seed_strings
-        ]
-
-
-    return None
-
-
 # ============================================================
-# 9. 从用户输入提取 duration
-#
-# 当前支持例如：
-#
-# duration=300
-# 运行300秒
-# 每个300秒
-# 仿真时长300秒
+# 9. 提取 duration
 # ============================================================
 
 def extract_duration_from_user_query(
@@ -307,14 +292,20 @@ def extract_duration_from_user_query(
 
     patterns = [
 
-        r"duration\s*"
-        r"(?:=|:|为|是)?\s*"
-        r"(\d+)",
+        (
+            r"duration\s*"
+            r"(?:=|:|为|是)?\s*"
+            r"(\d+)"
+        ),
 
-        r"(?:每个|每次|运行|仿真时长|时长)"
-        r"\s*(\d+)\s*秒",
+        (
+            r"(?:每个|每次|运行|仿真时长|时长)"
+            r"\s*(\d+)\s*秒"
+        ),
 
-        r"(\d+)\s*秒",
+        (
+            r"(\d+)\s*秒"
+        ),
     ]
 
 
@@ -338,7 +329,61 @@ def extract_duration_from_user_query(
 
 
 # ============================================================
-# 10. Parse Tool Arguments
+# 10. 提取 average_queue sample std 阈值
+#
+# 支持例如：
+#
+# average_queue 的 sample std > 0.08
+# average_queue 标准差 > 0.08
+#
+# ============================================================
+
+def extract_queue_std_threshold(
+    user_query: str,
+) -> float | None:
+
+    patterns = [
+
+        (
+            r"average_queue"
+            r".*?"
+            r"(?:sample\s*)?std"
+            r"\s*>\s*"
+            r"(\d+(?:\.\d+)?)"
+        ),
+
+        (
+            r"average_queue"
+            r".*?"
+            r"(?:样本)?标准差"
+            r"\s*>\s*"
+            r"(\d+(?:\.\d+)?)"
+        ),
+    ]
+
+
+    for pattern in patterns:
+
+        match = re.search(
+            pattern,
+            user_query,
+            re.IGNORECASE
+            | re.DOTALL,
+        )
+
+
+        if match:
+
+            return float(
+                match.group(1)
+            )
+
+
+    return None
+
+
+# ============================================================
+# 11. Tool Arguments Parsing
 # ============================================================
 
 def parse_tool_arguments(
@@ -403,20 +448,35 @@ def parse_tool_arguments(
 
 
 # ============================================================
-# 11. Agent Runtime Validation
+# 12. Runtime Validation
+#
+# Part 4 的核心升级之一。
+#
+# 除了验证：
+#
+# - 类型
+# - 合法性
+# - 来源
+#
+# 还要验证：
+#
+# - 当前到底应该运行 initial 还是 extra？
+# - extra 是否真的满足触发条件？
+#
 # ============================================================
 
 def validate_tool_arguments(
     tool_name: str,
     arguments: dict,
     user_query: str,
+    dynamic_state: dict,
 ) -> dict:
 
     errors = []
 
 
     # ========================================================
-    # 11.1 Tool Name
+    # 12.1 Tool Name
     # ========================================================
 
     if (
@@ -439,7 +499,7 @@ def validate_tool_arguments(
 
 
     # ========================================================
-    # 11.2 Unknown Arguments
+    # 12.2 Unknown Arguments
     # ========================================================
 
     allowed_arguments = {
@@ -471,7 +531,7 @@ def validate_tool_arguments(
 
 
     # ========================================================
-    # 11.3 Scenario
+    # 12.3 Scenario
     # ========================================================
 
     scenario = arguments.get(
@@ -508,7 +568,7 @@ def validate_tool_arguments(
 
 
     # ========================================================
-    # 11.4 Seeds
+    # 12.4 Seeds 基础检查
     # ========================================================
 
     seeds = arguments.get(
@@ -576,63 +636,199 @@ def validate_tool_arguments(
 
 
     # ========================================================
-    # 11.5 Seeds 来源验证
+    # 12.5 从用户请求读取两组 seed
     # ========================================================
 
-    user_seeds = (
-        extract_seeds_from_user_query(
-            user_query
+    initial_seeds = (
+        extract_named_seed_group(
+            user_query,
+            "initial_seeds",
         )
     )
 
 
-    if user_seeds is None:
+    extra_seeds = (
+        extract_named_seed_group(
+            user_query,
+            "extra_seeds",
+        )
+    )
+
+
+    if initial_seeds is None:
 
         errors.append(
-            "用户没有明确提供 seeds。"
-            "禁止模型自行生成随机种子列表。"
+            "用户没有明确提供 initial_seeds。"
         )
 
 
-    elif isinstance(
-        seeds,
-        list,
-    ):
+    if extra_seeds is None:
 
-        # -----------------------------------------------
-        # 不要求顺序完全一致。
-        #
-        # 用户 [42,43,44]
-        # 模型 [44,42,43]
-        #
-        # 实验集合仍然相同。
-        # -----------------------------------------------
-
-        valid_seed_types = all(
-
-            isinstance(seed, int)
-            and not isinstance(seed, bool)
-
-            for seed in seeds
+        errors.append(
+            "用户没有明确提供 extra_seeds。"
         )
-
-
-        if valid_seed_types:
-
-            if (
-                sorted(seeds)
-                != sorted(user_seeds)
-            ):
-
-                errors.append(
-                    "seeds 与用户输入不一致："
-                    f"用户提供 {user_seeds}，"
-                    f"模型生成 {seeds}"
-                )
 
 
     # ========================================================
-    # 11.6 Duration
+    # 12.6 动态阶段 Validation
+    #
+    # Stage 1:
+    # 必须运行 initial_seeds
+    #
+    # Stage 2:
+    # 只有满足 threshold 条件后
+    # 才允许运行 extra_seeds
+    #
+    # ========================================================
+
+    if (
+        isinstance(seeds, list)
+        and all(
+            isinstance(seed, int)
+            and not isinstance(seed, bool)
+            for seed in seeds
+        )
+        and initial_seeds is not None
+        and extra_seeds is not None
+    ):
+
+        tool_seed_group = (
+            sorted(seeds)
+        )
+
+
+        expected_initial_group = (
+            sorted(
+                initial_seeds
+            )
+        )
+
+
+        expected_extra_group = (
+            sorted(
+                extra_seeds
+            )
+        )
+
+
+        # ----------------------------------------------------
+        # Initial 尚未执行
+        # ----------------------------------------------------
+
+        if not dynamic_state[
+            "initial_completed"
+        ]:
+
+            if (
+                tool_seed_group
+                != expected_initial_group
+            ):
+
+                errors.append(
+                    "第一轮必须只运行 "
+                    "用户提供的 initial_seeds。"
+                    f"用户 initial_seeds="
+                    f"{initial_seeds}，"
+                    f"Tool 生成 seeds={seeds}"
+                )
+
+
+        # ----------------------------------------------------
+        # Initial 已执行
+        # ----------------------------------------------------
+
+        else:
+
+            # extra 已经执行过
+            if dynamic_state[
+                "extra_completed"
+            ]:
+
+                errors.append(
+                    "extra_seeds 已经执行完成，"
+                    "不得重复运行第二轮实验。"
+                )
+
+
+            else:
+
+                initial_queue_std = (
+                    dynamic_state[
+                        "initial_queue_std"
+                    ]
+                )
+
+
+                threshold = (
+                    dynamic_state[
+                        "threshold"
+                    ]
+                )
+
+
+                # --------------------------------------------
+                # 没有可靠第一轮统计
+                # --------------------------------------------
+
+                if initial_queue_std is None:
+
+                    errors.append(
+                        "第一轮没有可用的 "
+                        "average_queue std，"
+                        "不能启动 extra_seeds。"
+                    )
+
+
+                elif threshold is None:
+
+                    errors.append(
+                        "用户没有提供有效的 "
+                        "average_queue std 判断阈值。"
+                    )
+
+
+                # --------------------------------------------
+                # 条件满足
+                # --------------------------------------------
+
+                elif (
+                    initial_queue_std
+                    > threshold
+                ):
+
+                    if (
+                        tool_seed_group
+                        != expected_extra_group
+                    ):
+
+                        errors.append(
+                            "触发第二轮后，"
+                            "只能运行用户提供的 "
+                            "extra_seeds。"
+                            f"用户 extra_seeds="
+                            f"{extra_seeds}，"
+                            f"Tool 生成 seeds={seeds}"
+                        )
+
+
+                # --------------------------------------------
+                # 条件不满足
+                # --------------------------------------------
+
+                else:
+
+                    errors.append(
+                        "当前不满足第二轮触发条件："
+                        f"第一轮 average_queue std="
+                        f"{initial_queue_std}，"
+                        f"threshold={threshold}，"
+                        "因为 std <= threshold，"
+                        "不允许运行 extra_seeds。"
+                    )
+
+
+    # ========================================================
+    # 12.7 Duration
     # ========================================================
 
     duration = arguments.get(
@@ -665,7 +861,7 @@ def validate_tool_arguments(
 
 
     # ========================================================
-    # 11.7 Duration 来源验证
+    # 12.8 Duration 来源检查
     # ========================================================
 
     user_duration = (
@@ -679,7 +875,6 @@ def validate_tool_arguments(
 
         errors.append(
             "用户没有明确提供 duration。"
-            "禁止模型自行生成仿真时长。"
         )
 
 
@@ -692,12 +887,12 @@ def validate_tool_arguments(
         errors.append(
             "duration 与用户输入不一致："
             f"用户提供 {user_duration}，"
-            f"模型生成 {duration}"
+            f"Tool 生成 {duration}"
         )
 
 
     # ========================================================
-    # 11.8 Return
+    # 12.9 Return
     # ========================================================
 
     return {
@@ -711,7 +906,7 @@ def validate_tool_arguments(
 
 
 # ============================================================
-# 12. Batch Tool Wrapper
+# 13. Batch Tool Wrapper
 # ============================================================
 
 def run_batch_sumo_experiment(
@@ -720,26 +915,12 @@ def run_batch_sumo_experiment(
     duration: int,
 ) -> dict:
 
-    """
-    Agent Tool Wrapper。
-
-    Agent 使用语义参数：
-        scenario
-        seeds
-        duration
-
-    真正的实验由：
-        run_batch_experiment()
-
-    负责。
-    """
-
     print(
         "\n===================================="
     )
 
     print(
-        "Real Batch SUMO Tool"
+        "Dynamic Agent → Real Batch SUMO Tool"
     )
 
     print(
@@ -786,7 +967,7 @@ TOOL_MAP[
 
 
 # ============================================================
-# 13. Execute Tool
+# 14. Execute Tool
 # ============================================================
 
 def execute_tool(
@@ -827,7 +1008,7 @@ def execute_tool(
 
 
 # ============================================================
-# 14. Call Model
+# 15. Call Model
 # ============================================================
 
 def call_model(
@@ -855,10 +1036,12 @@ def call_model(
                     "auto",
 
                 max_tokens=
-                    2000,
+                    2500,
 
                 extra_body={
+
                     "thinking": {
+
                         "type":
                             "disabled"
                     }
@@ -941,7 +1124,149 @@ def call_model(
 
 
 # ============================================================
-# 15. Agent Loop
+# 16. 更新 Dynamic State
+#
+# Tool真正执行完成后，
+# Runtime记录目前进行到哪一步。
+# ============================================================
+
+def update_dynamic_state(
+    dynamic_state: dict,
+    arguments: dict,
+    tool_result: dict,
+    user_query: str,
+) -> None:
+
+    # --------------------------------------------------------
+    # 实验失败，不推进阶段
+    # --------------------------------------------------------
+
+    if (
+        tool_result.get("status")
+        != "success"
+    ):
+
+        return
+
+
+    seeds = arguments.get(
+        "seeds"
+    )
+
+
+    if not isinstance(
+        seeds,
+        list,
+    ):
+
+        return
+
+
+    initial_seeds = (
+        extract_named_seed_group(
+            user_query,
+            "initial_seeds",
+        )
+    )
+
+
+    extra_seeds = (
+        extract_named_seed_group(
+            user_query,
+            "extra_seeds",
+        )
+    )
+
+
+    # ========================================================
+    # Initial Batch 完成
+    # ========================================================
+
+    if (
+        initial_seeds is not None
+        and sorted(seeds)
+        == sorted(initial_seeds)
+    ):
+
+        dynamic_state[
+            "initial_completed"
+        ] = True
+
+
+        queue_statistics = (
+            tool_result
+            .get(
+                "aggregated_metrics",
+                {}
+            )
+            .get(
+                "average_queue",
+                {}
+            )
+        )
+
+
+        dynamic_state[
+            "initial_queue_std"
+        ] = (
+            queue_statistics
+            .get(
+                "std"
+            )
+        )
+
+
+        print(
+            "\n===== Dynamic State Updated ====="
+        )
+
+        print(
+            "Initial Completed:",
+            True,
+        )
+
+        print(
+            "Initial average_queue std:",
+            dynamic_state[
+                "initial_queue_std"
+            ],
+        )
+
+        print(
+            "Threshold:",
+            dynamic_state[
+                "threshold"
+            ],
+        )
+
+
+    # ========================================================
+    # Extra Batch 完成
+    # ========================================================
+
+    elif (
+        extra_seeds is not None
+        and sorted(seeds)
+        == sorted(extra_seeds)
+    ):
+
+        dynamic_state[
+            "extra_completed"
+        ] = True
+
+
+        print(
+            "\n===== Dynamic State Updated ====="
+        )
+
+        print(
+            "Extra Completed:",
+            True,
+        )
+
+
+# ============================================================
+# 17. Agent Loop
 # ============================================================
 
 def run_agent(
@@ -950,12 +1275,101 @@ def run_agent(
 ) -> str:
 
     # ========================================================
-    # 15.1 Metric Definitions → Prompt
+    # 17.1 从用户任务中提取动态配置
+    # ========================================================
+
+    initial_seeds = (
+        extract_named_seed_group(
+            user_query,
+            "initial_seeds",
+        )
+    )
+
+
+    extra_seeds = (
+        extract_named_seed_group(
+            user_query,
+            "extra_seeds",
+        )
+    )
+
+
+    threshold = (
+        extract_queue_std_threshold(
+            user_query
+        )
+    )
+
+
+    duration = (
+        extract_duration_from_user_query(
+            user_query
+        )
+    )
+
+
+    print(
+        "\n===== Parsed Dynamic Task ====="
+    )
+
+    print(
+        "Initial Seeds:",
+        initial_seeds,
+    )
+
+    print(
+        "Extra Seeds:",
+        extra_seeds,
+    )
+
+    print(
+        "Queue Std Threshold:",
+        threshold,
+    )
+
+    print(
+        "Duration:",
+        duration,
+    )
+
+
+    # ========================================================
+    # 17.2 Dynamic State
+    #
+    # 这是 Runtime 内部状态，
+    # 和 messages 不完全是一回事。
+    #
+    # messages:
+    #   给 LLM 看
+    #
+    # dynamic_state:
+    #   Runtime 自己用于控制和验证
+    # ========================================================
+
+    dynamic_state = {
+
+        "initial_completed":
+            False,
+
+        "initial_queue_std":
+            None,
+
+        "extra_completed":
+            False,
+
+        "threshold":
+            threshold,
+    }
+
+
+    # ========================================================
+    # 17.3 Metric Definitions
     # ========================================================
 
     metric_definition_text = (
         "\n".join(
             [
+
                 f"- {name}: {definition}"
 
                 for name, definition
@@ -966,82 +1380,118 @@ def run_agent(
 
 
     # ========================================================
-    # 15.2 Messages
+    # 17.4 System Prompt
     # ========================================================
 
     messages = [
 
         {
+
             "role":
                 "system",
 
             "content": (
 
-                "你是一个 Traffic Simulation Agent。"
+                "你是一个 Traffic Simulation Agent V1。"
 
-                "你可以通过工具运行真实的多 seed "
-                "SUMO 批量交通仿真实验。"
+                "你可以通过 Batch Tool 运行真实的 "
+                "SUMO 多 seed 实验。"
 
-                "当前可用场景只有 cross。"
+                "当前支持动态两阶段实验。"
 
-                "批量实验必须获得用户明确提供的："
-                "scenario、seeds 和 duration。"
+                "用户会明确提供："
+                "initial_seeds、extra_seeds、duration，"
+                "以及 average_queue sample std 的判断阈值。"
 
-                "不得自行添加、删除或修改用户的 seeds。"
+                "你必须严格执行以下动态规则："
 
-                "不得自行猜测 duration。"
+                "第一步只能运行 initial_seeds。"
 
-                "如果缺少必要参数，"
-                "直接向用户询问，"
-                "不要调用工具。"
+                "禁止第一轮同时运行 initial_seeds "
+                "和 extra_seeds。"
 
-                "如果用户只询问概念、指标含义或一般知识，"
-                "不要调用 SUMO 工具。"
+                "第一轮 Tool Result 返回后，"
+                "读取 aggregated_metrics 中 "
+                "average_queue 的 std。"
+
+                "如果第一轮 average_queue std "
+                "严格大于用户提供的 threshold，"
+                "你必须继续调用 Batch Tool，"
+                "并且第二轮只能使用 extra_seeds。"
+
+                "如果第一轮 average_queue std "
+                "小于或等于 threshold，"
+                "不得运行 extra_seeds，"
+                "应直接给出最终回答。"
+
+                "不得自行创建新的 seed。"
+
+                "不得增加、删除或修改"
+                "用户提供的 seed。"
+
+                "不得修改用户提供的 threshold。"
+
+                "不得自行修改 duration。"
+
+                "每一次模型决策应基于"
+                "此前真实 Tool Result。"
+
+                "第二轮是否运行，"
+                "必须根据第一轮结果决定，"
+                "不能在第一轮结果产生之前"
+                "提前决定。"
 
                 "如果工具返回 validation_error，"
-                "根据错误信息向用户说明，"
-                "不得绕过验证。"
+                "必须遵守 Runtime Validation，"
+                "不得绕过。"
 
-                "如果工具返回 tool_execution_error "
-                "或 batch_execution_error，"
-                "说明实验执行失败，"
-                "不得将失败结果描述为成功。"
+                "如果工具返回 tool_execution_error、"
+                "batch_execution_error 或 partial_success，"
+                "必须如实说明实验执行状态。"
 
-                "如果 status 为 partial_success，"
-                "必须明确说明只有部分 seed 成功，"
-                "并指出失败数量。"
+                "mean、std、min、max "
+                "均由 Python 确定性计算。"
+                "不得重新计算或修改 Python 给出的统计值。"
 
-                "工具返回的 mean、std、min、max "
-                "均由 Python 确定性计算完成。"
-                "不得自行重新计算或修改这些数值。"
+                "当前 std 为 statistics.stdev "
+                "计算的样本标准差。"
 
-                "当前 std 使用 statistics.stdev，"
-                "即样本标准差。"
+                "如果执行第二轮，"
+                "最终回答应明确说明："
+                "第一轮结果、threshold、"
+                "为什么触发第二轮、"
+                "第二轮结果。"
 
-                "当 seed 数量很少时，"
+                "目前没有 Python 提供"
+                "两轮合并后的总体统计。"
+                "因此不得自行把 initial 和 extra "
+                "六个 seed 合并后计算新的 mean/std。"
+
+                "只能分别报告两轮"
+                "Python 已提供的统计结果。"
+
+                "如果只使用少量 seed，"
                 "可以描述观察到的波动，"
-                "但不得仅凭少量 seed "
-                "声称系统具有高鲁棒性或统计显著性。"
+                "不得声称具有统计显著性或高鲁棒性。"
 
-                "必须严格遵循以下项目指标定义：\n"
+                "不要根据这些性能指标"
+                "虚构交通拥堵的具体原因。"
+
+                "seed 只影响场景中实际使用随机数的过程。"
+                "不得未经证据声称某个具体模块"
+                "一定受到 seed 影响。"
+
+                "必须严格遵循以下指标定义：\n"
 
                 f"{metric_definition_text}\n"
 
-                "分析结果时区分事实与推断。"
-
-                "可以描述："
-                "哪个 seed 较高、较低，"
-                "mean/std/range 如何，"
-                "观察到的跨 seed 波动。"
-
-                "不要根据这些指标虚构拥堵原因。"
-
-                "真实实验结果的数据来源应明确说明为 SUMO。"
+                "真实实验的数据来源必须明确说明为 SUMO。"
             ),
         },
 
 
         {
+
             "role":
                 "user",
 
@@ -1052,7 +1502,7 @@ def run_agent(
 
 
     # ========================================================
-    # 15.3 Agent Loop
+    # 17.5 Agent Loop
     # ========================================================
 
     for step in range(
@@ -1065,9 +1515,9 @@ def run_agent(
         )
 
 
-        # ----------------------------------------------------
-        # LLM
-        # ----------------------------------------------------
+        # ====================================================
+        # 调用 LLM
+        # ====================================================
 
         model_result = (
             call_model(
@@ -1121,12 +1571,14 @@ def run_agent(
             .finish_reason,
         )
 
+
         print(
             "Content:",
             repr(
                 message.content
             ),
         )
+
 
         print(
             "Tool Calls:",
@@ -1135,7 +1587,7 @@ def run_agent(
 
 
         # ====================================================
-        # 15.4 No Tool → Finish
+        # No Tool Call → Agent结束
         # ====================================================
 
         if not message.tool_calls:
@@ -1147,7 +1599,7 @@ def run_agent(
 
 
         # ====================================================
-        # 15.5 Assistant Tool Calls → Messages
+        # Assistant Tool Calls → Messages
         # ====================================================
 
         messages.append(
@@ -1191,7 +1643,7 @@ def run_agent(
 
 
         # ====================================================
-        # 15.6 Execute All Tool Calls
+        # 执行 Tool Calls
         # ====================================================
 
         for tool_call in (
@@ -1216,6 +1668,7 @@ def run_agent(
                 "\nTool Name:",
                 tool_name,
             )
+
 
             print(
                 "Raw Arguments:",
@@ -1250,8 +1703,9 @@ def run_agent(
                         "argument_parse_error",
 
                     "message": (
-                        "工具参数 JSON 解析失败，"
-                        "本次 Batch Tool 未执行。"
+                        "Tool Arguments JSON "
+                        "解析失败，"
+                        "本次实验未执行。"
                     ),
 
                     "error":
@@ -1260,8 +1714,8 @@ def run_agent(
                         ],
 
                     "instruction": (
-                        "重新生成符合 "
-                        "Tool Schema 的合法参数。"
+                        "请重新生成符合 "
+                        "Tool Schema 的参数。"
                     ),
                 }
 
@@ -1301,7 +1755,7 @@ def run_agent(
 
 
             # ================================================
-            # Validation
+            # Dynamic Runtime Validation
             # ================================================
 
             validation = (
@@ -1315,6 +1769,9 @@ def run_agent(
 
                     user_query=
                         user_query,
+
+                    dynamic_state=
+                        dynamic_state,
                 )
             )
 
@@ -1324,6 +1781,10 @@ def run_agent(
                 validation,
             )
 
+
+            # ================================================
+            # Validation Failed
+            # ================================================
 
             if not validation[
                 "valid"
@@ -1335,8 +1796,9 @@ def run_agent(
                         "validation_error",
 
                     "message": (
-                        "Batch Tool 未执行，"
-                        "因为参数验证失败。"
+                        "Dynamic Batch Tool 未执行，"
+                        "因为 Runtime Validation "
+                        "验证失败。"
                     ),
 
                     "errors":
@@ -1345,17 +1807,19 @@ def run_agent(
                         ],
 
                     "instruction": (
-                        "不得猜测、添加或修改"
-                        "用户未明确提供的实验参数。"
+                        "必须严格遵守用户提供的"
+                        " initial_seeds、extra_seeds、"
+                        "threshold 和 duration，"
+                        "不得绕过动态实验规则。"
                     ),
                 }
 
 
-            else:
+            # ================================================
+            # Validation PASS → Real SUMO
+            # ================================================
 
-                # ============================================
-                # Real Batch SUMO Experiment
-                # ============================================
+            else:
 
                 tool_result = (
                     execute_tool(
@@ -1366,6 +1830,26 @@ def run_agent(
                         arguments=
                             arguments,
                     )
+                )
+
+
+                # ============================================
+                # Tool完成后更新 Runtime状态
+                # ============================================
+
+                update_dynamic_state(
+
+                    dynamic_state=
+                        dynamic_state,
+
+                    arguments=
+                        arguments,
+
+                    tool_result=
+                        tool_result,
+
+                    user_query=
+                        user_query,
                 )
 
 
@@ -1398,7 +1882,7 @@ def run_agent(
 
 
     # ========================================================
-    # max_steps
+    # max_steps Guard
     # ========================================================
 
     return (
@@ -1408,10 +1892,27 @@ def run_agent(
 
 
 # ============================================================
-# 16. Main
+# 18. Main
 # ============================================================
 
 if __name__ == "__main__":
+
+    print(
+        "\n===================================="
+    )
+
+    print(
+        "Traffic Simulation Agent V1"
+    )
+
+    print(
+        "Day 5 Part 4 - Dynamic Decision"
+    )
+
+    print(
+        "===================================="
+    )
+
 
     user_query = input(
         "\nUser: "
@@ -1428,6 +1929,7 @@ if __name__ == "__main__":
     print(
         "\n===== Final Answer ====="
     )
+
 
     print(
         final_answer
