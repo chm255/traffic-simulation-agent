@@ -5,7 +5,7 @@ from pathlib import Path
 import openai
 from openai import OpenAI
 
-from day04_sumo_metrics import (
+from day04.day04_sumo_metrics import (
     run_sumo_metrics,
 )
 
