@@ -1,6 +1,6 @@
 # Traffic Simulation Agent
 
-基于 **LLM Agent + SUMO / TraCI + RAG** 的交通仿真实验智能助手。
+基于 **LLM Agent + SUMO / TraCI + RAG + LangGraph** 的交通仿真实验智能助手。
 
 项目目标是让用户通过自然语言描述交通仿真实验任务，由 Agent 自动完成任务理解、知识检索、实验调用、结果计算与解释，并逐步构建面向交通科研实验的智能 Agent。
 
@@ -51,6 +51,8 @@ SUMO 仿真执行
 - TraCI
 - Sentence Transformers
 - RAG
+- LangGraph
+- SQLite Checkpoint
 - JSON / Structured Output
 
 当前本地 Embedding 模型：
@@ -63,34 +65,54 @@ sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 
 ## Current Agent Architecture
 
-当前系统架构：
+当前系统已升级为 **Traffic Simulation Agent V3**。
+
+相比 V2，RAG、SUMO Tool、Tool Schema 和 Validation 等能力层基本不变，主要变化是：
+
+> 使用 LangGraph 替代原先手写的 `for / if / elif` Agent Loop，对 Agent 的 State、Node、Edge、Conditional Edge、Checkpoint 与 Thread 进行显式编排。
+
+当前架构：
 
 ```text
 User
  ↓
-LLM
+LangGraph
  ↓
-Agent Runtime
- ├─ Tool Calling
- ├─ Validation
- ├─ Agent Loop
- ├─ Error Handling
- └─ State / Workflow Control
+LLM Node
  ↓
- ├───────────────┐
- ↓               ↓
-RAG Tool       SUMO Tool
- ↓               ↓
-Knowledge       TraCI
-Base              ↓
-                  SUMO
- └───────┬────────┘
+Conditional Edge / Router
+ ├─ 无 Tool Call → END
+ │
+ └─ 有 Tool Call
+      ↓
+    Tool Node
+    ├─ RAG Tool
+    │    ↓
+    │ Knowledge Base
+    │
+    └─ SUMO Tool
          ↓
-     Tool Results
+       TraCI
          ↓
-        LLM
-         ↓
+       SUMO
+      ↓
+Tool Result
+      ↓
+   LLM Node
+      ↓
 下一步 Tool / Final Answer
+```
+
+同时加入 Checkpoint：
+
+```text
+LangGraph State
+      ↓
+ Checkpointer
+      ↓
+ Thread ID
+      ↓
+保存 / 恢复 Conversation State
 ```
 
 核心职责划分：
@@ -102,20 +124,27 @@ LLM
 → 工具选择
 → 结果解释
 
-Agent Runtime
-→ Agent Loop
+LangGraph
+→ 管理 Agent Workflow
+→ 管理 State
+→ 管理 Node / Edge
+→ 管理条件分支与循环
+→ 管理 Checkpoint / Thread
+→ 支持状态恢复
+
+Agent Runtime / Python
 → 参数解析
 → Validation
 → Error Handling
 → Tool Dispatch
-→ 状态控制
+→ 确定性逻辑与计算
 
 RAG
 → 提供项目知识
 → 解决 Knowledge Gap
 
 Tools / Python
-→ 执行确定性任务
+→ 执行确定性外部任务
 → 解决 Capability Gap
 
 SUMO / TraCI
@@ -199,7 +228,319 @@ Act / Finish
 
 ---
 
-### 4. Real SUMO Integration
+### 4. LangGraph Orchestration
+
+Day 7 将原先手写的 Agent Loop 迁移为 LangGraph。
+
+原先的控制方式：
+
+```text
+for / while
++
+if / elif
++
+手动维护 messages
++
+手动决定下一步调用哪个函数
+```
+
+迁移后：
+
+```text
+State
++
+Node
++
+Edge
++
+Conditional Edge
++
+Checkpoint
++
+Thread
+```
+
+#### State
+
+State 表示 Graph 中各个 Node 共同读取和更新的共享数据。
+
+当前 Traffic Simulation Agent 主要使用：
+
+```python
+class TrafficAgentState(TypedDict):
+    messages: ...
+```
+
+因此当前项目中最主要的 State 是 `messages`，但 State 并不等于 messages。
+
+未来可以继续加入：
+
+```text
+scenario
+seeds
+experiment_results
+current_stage
+error
+...
+```
+
+#### Node
+
+Node 是 Graph 中真正执行逻辑的节点，本质上通常仍然是 Python 函数。
+
+当前主要节点：
+
+```text
+llm_node
+→ 调用 DeepSeek
+→ 根据当前 messages 生成回答或 Tool Call
+
+tool_node
+→ 读取 Tool Call
+→ Validation
+→ 调用真实 Python Tool
+→ 将 Tool Result 写回 State
+```
+
+`START` 和 `END` 是 Graph 的特殊入口和出口标记，不是普通业务函数节点。
+
+#### Edge
+
+普通 Edge 表示固定执行顺序：
+
+```text
+tool_node
+↓
+llm_node
+```
+
+对应：
+
+```python
+builder.add_edge(...)
+```
+
+Conditional Edge 根据当前 State 动态决定下一步：
+
+```text
+llm_node
+↓
+是否存在 Tool Call？
+├─ Yes → tool_node
+└─ No  → END
+```
+
+对应：
+
+```python
+builder.add_conditional_edges(...)
+```
+
+#### LangGraph Agent Loop
+
+当前核心循环：
+
+```text
+START
+  ↓
+LLM Node
+  ↓
+Router
+ ├─ 无 Tool Call → END
+ │
+ └─ 有 Tool Call
+      ↓
+   Tool Node
+      ↓
+   LLM Node
+      ↓
+     ...
+```
+
+因此 LangGraph 并不是简单地“替代 if/else”，而是把原本隐藏在 Python 控制流中的：
+
+```text
+状态
++
+执行顺序
++
+循环
++
+条件分支
+```
+
+显式组织成 Graph，便于后续扩展复杂 Workflow。
+
+---
+
+### 5. Checkpoint 与多轮 Conversation State
+
+Day 7 进一步加入了 LangGraph Checkpoint。
+
+需要区分三个概念：
+
+```text
+State
+→ Agent 当前共享的数据
+
+Checkpoint
+→ 某一时刻 Graph State 的快照
+
+Thread
+→ 一系列属于同一个会话 / 任务的 Checkpoint
+```
+
+#### thread_id
+
+每一个独立对话 / Agent 任务可以使用一个 `thread_id`：
+
+```python
+{
+    "configurable": {
+        "thread_id": "traffic-agent-demo"
+    }
+}
+```
+
+同一个 `thread_id`：
+
+```text
+恢复已有 Conversation State
+```
+
+新的 `thread_id`：
+
+```text
+创建新的独立 Conversation State
+```
+
+因此不同 Thread 之间不会自动共享历史消息。
+
+#### InMemorySaver
+
+```text
+Conversation State
+↓
+RAM
+↓
+当前 Python 进程
+```
+
+特点：
+
+- 同一次程序运行中可以实现多轮对话；
+- 同一个 thread 可以持续恢复历史 State；
+- Python 程序退出后，State 消失。
+
+#### SqliteSaver
+
+```text
+Conversation State
+↓
+SQLite
+↓
+Disk
+```
+
+特点：
+
+- State 被持久化到本地 SQLite；
+- Python 程序退出后数据仍然存在；
+- 下次重新启动程序后，只要使用相同的 `thread_id`，即可恢复历史 State；
+- 不同 `thread_id` 之间相互隔离。
+
+当前 Checkpoint 文件：
+
+```text
+checkpoints/traffic_agent.sqlite
+```
+
+注意：
+
+> `InMemorySaver` 和 `SqliteSaver` 的区别主要是 State 的存储位置和生命周期。
+
+它们目前承载的仍然是 **thread-scoped short-term memory**。
+
+```text
+InMemorySaver
+→ RAM 中的短期会话状态
+
+SqliteSaver
+→ 持久化到磁盘的短期会话状态
+```
+
+真正跨不同 Thread / Session 的 Long-term Memory 当前尚未实现。
+
+---
+
+### 6. Conversation Context Growth
+
+Checkpoint 可以恢复历史 messages，但持续对话会使 `messages` 不断增长。
+
+例如：
+
+```text
+第 1 轮：
+System
+User 1
+Assistant 1
+
+第 2 轮：
+System
+User 1
+Assistant 1
+User 2
+Assistant 2
+
+第 N 轮：
+历史 messages
++
+最新 User
+```
+
+因此每一次：
+
+```python
+client.chat.completions.create(
+    messages=state["messages"]
+)
+```
+
+都会将越来越多的历史消息作为 LLM 输入。
+
+可能带来：
+
+```text
+Input Tokens 增加
+↓
+API 成本增加
++
+响应时间增加
++
+最终接近 Context Window 上限
+```
+
+后续可考虑：
+
+```text
+Message Trimming
+→ 只保留最近 N 轮
+
+Conversation Summary
+→ 将早期历史压缩为摘要
+
+Structured State
+→ 将 scenario / seed / results 等任务状态从聊天文本中独立出来
+
+Experiment Result Storage
+→ 正式实验结果单独保存为 CSV / JSON / Database
+```
+
+Checkpoint 的职责是恢复 Agent Workflow State，并不应该替代正式科研实验结果存储。
+
+---
+
+### 7. Real SUMO Integration
 
 已实现：
 
@@ -486,9 +827,24 @@ SUMO Tool
 结合定义解释真实实验结果
 ```
 
-当前系统可以称为：
+当前系统已经进一步通过 LangGraph 完成编排层升级，可以称为：
 
-> **Traffic Simulation Agent V2**
+> **Traffic Simulation Agent V3**
+
+V2 与 V3 的主要区别：
+
+```text
+V2
+→ RAG + SUMO + 手写 Agent Loop
+
+V3
+→ RAG + SUMO + LangGraph Orchestration
+→ State / Node / Edge
+→ Checkpoint / Thread
+→ Persistent Conversation State
+```
+
+RAG、SUMO、Tool 本身的能力并没有因为 LangGraph 而改变，变化的主要是 Agent 的 Workflow Orchestration。
 
 ---
 
@@ -521,10 +877,22 @@ traffic-simulation-agent/
 │   ├── day06_rag_qa.py
 │   └── day06_rag_tool_agent.py
 │
+├── day07/
+│   ├── __init__.py
+│   ├── day07_basic_graph.py
+│   ├── day07_conditional_graph.py
+│   ├── day07_llm_tool_graph.py
+│   ├── day07_traffic_agent_graph.py
+│   ├── day07_traffic_agent_memory.py
+│   └── day07_traffic_agent_sqlite.py
+│
 ├── knowledge/
 │   ├── metrics.md
 │   ├── scenarios.md
 │   └── experiment_rules.md
+│
+├── checkpoints/
+│   └── traffic_agent.sqlite
 │
 ├── sumotest/
 │   ├── cross.sumocfg
@@ -537,7 +905,7 @@ traffic-simulation-agent/
 
 ---
 
-## Running Traffic Simulation Agent V2
+## Running Traffic Simulation Agent V3
 
 激活环境：
 
@@ -545,11 +913,47 @@ traffic-simulation-agent/
 conda activate traffic-agent
 ```
 
-从项目根目录运行：
+### V2：手写 Agent Loop
 
 ```powershell
 python -m day06.day06_rag_tool_agent
 ```
+
+### V3：LangGraph Agent
+
+```powershell
+python -m day07.day07_traffic_agent_graph
+```
+
+### V3：进程内多轮 Conversation State
+
+```powershell
+python -m day07.day07_traffic_agent_memory
+```
+
+使用：
+
+```text
+InMemorySaver
+```
+
+程序退出后 Conversation State 消失。
+
+### V3：SQLite Persistent Conversation State
+
+```powershell
+python -m day07.day07_traffic_agent_sqlite
+```
+
+使用：
+
+```text
+SqliteSaver
++
+thread_id
+```
+
+程序退出后，可通过同一个 `thread_id` 恢复之前的 Conversation State。
 
 示例知识问题：
 
@@ -571,6 +975,22 @@ python -m day06.day06_rag_tool_agent
 并结合这个定义解释实验结果。
 ```
 
+示例多轮对话：
+
+```text
+User:
+我们项目里的 throughput 是怎么定义的？
+
+Assistant:
+...
+
+User:
+那它的单位呢？
+
+Assistant:
+知道“它”指 throughput。
+```
+
 ---
 
 ## API Key
@@ -583,11 +1003,19 @@ api.txt
 
 该文件不应提交到 Git。
 
-请确保 `.gitignore` 包含：
+请确保 `.gitignore` 至少包含：
 
 ```gitignore
 api.txt
 ```
+
+Checkpoint 数据库是否提交 Git 可按项目需求决定。学习阶段通常建议忽略运行时状态文件，例如：
+
+```gitignore
+checkpoints/*.sqlite
+```
+
+正式科研结果应独立保存在 `results/`、CSV、JSON 或数据库中，而不是依赖 LangGraph Checkpoint。
 
 ---
 
@@ -608,6 +1036,7 @@ api.txt
 当前测试使用的 SUMO 版本：
 
 ```text
+SUMO 1.26.0
 SUMO 1.27.1
 ```
 
@@ -634,9 +1063,13 @@ SUMO 1.27.1
 - [x] RAG
 - [x] RAG Tool
 - [x] RAG + SUMO Agent
-- [ ] LangGraph
+- [x] LangGraph
 - [ ] MCP
 - [ ] Agent Evaluation
+- [x] Thread-scoped Conversation State
+- [x] SQLite Persistent Checkpoint
+- [ ] Long-term Memory
+- [ ] Context / Message Management
 - [ ] Experiment Memory
 - [ ] Scenario Modification Tools
 - [ ] Automatic Experiment Comparison
@@ -646,6 +1079,63 @@ SUMO 1.27.1
 ---
 
 ## Notes
+
+### Day 7：LangGraph 学习总结
+
+Day 7 的核心不是让 Agent 获得新的 RAG 或 SUMO 能力，而是升级 **Agent Orchestration**。
+
+```text
+Day 6
+→ 手写 for / if / elif 管理 Agent Loop
+
+Day 7
+→ LangGraph 管理 State / Node / Edge / Checkpoint
+```
+
+最重要的理解：
+
+```text
+Node
+→ 执行什么
+
+Edge
+→ 下一步去哪里
+
+State
+→ Graph 当前共享数据
+
+Conditional Edge
+→ 根据 State 动态选择路径
+
+Checkpoint
+→ 保存某一时刻 State
+
+Thread ID
+→ 标识并恢复某一个独立会话 / Agent 任务
+```
+
+LangGraph 并不是为了替代所有 Python `if / else`。
+
+函数内部的确定性业务逻辑仍然适合使用普通 Python：
+
+```python
+if seed < 0:
+    ...
+```
+
+LangGraph 更适合管理 Agent / Workflow 级别的复杂流程：
+
+```text
+LLM
+↓
+RAG / SUMO
+↓
+Evaluate
+↓
+Retry / Continue / End
+```
+
+---
 
 ### Agent 职责划分
 

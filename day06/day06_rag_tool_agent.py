@@ -647,6 +647,17 @@ Important rules:
 
 After all necessary tools have been executed, give the user
 a clear final answer.
+
+Scientific interpretation rules:
+
+- Distinguish observed results from causal explanations.
+- Do not claim that one metric caused another unless the experiment
+  explicitly supports that causal conclusion.
+- Do not predict how a metric would change under a longer simulation,
+  different seed, or different scenario unless that experiment was
+  actually performed.
+- For finite-horizon metrics, describe only what is observed within
+  the specified observation window.
 """.strip()
 
 
