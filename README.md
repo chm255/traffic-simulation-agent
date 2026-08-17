@@ -1,6 +1,6 @@
 # Traffic Simulation Agent
 
-基于 **LLM Agent + SUMO / TraCI + RAG + LangGraph** 的交通仿真实验智能助手。
+基于 **LLM Agent + SUMO / TraCI + RAG + LangGraph** 的交通仿真实验智能助手，并逐步加入 Human-in-the-loop、Tool Permission Policy 与 Context Management。
 
 项目目标是让用户通过自然语言描述交通仿真实验任务，由 Agent 自动完成任务理解、知识检索、实验调用、结果计算与解释，并逐步构建面向交通科研实验的智能 Agent。
 
@@ -76,34 +76,53 @@ sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2
 ```text
 User
  ↓
-LangGraph
+LangGraph State
+ ↓
+Context Manager
  ↓
 LLM Node
  ↓
-Conditional Edge / Router
- ├─ 无 Tool Call → END
+Tool Call?
+ ├─ No → END
  │
- └─ 有 Tool Call
+ └─ Yes
       ↓
-    Tool Node
-    ├─ RAG Tool
-    │    ↓
-    │ Knowledge Base
-    │
-    └─ SUMO Tool
-         ↓
-       TraCI
-         ↓
-       SUMO
-      ↓
-Tool Result
-      ↓
-   LLM Node
-      ↓
-下一步 Tool / Final Answer
+Permission Policy
+ ┌────────┼──────────┐
+ ↓        ↓          ↓
+AUTO   APPROVAL     DENY
+ ↓        ↓          ↓
+Tool   interrupt()  Block
+Node      ↓
+        Human
+       /     \
+    Approve  Reject
+      ↓        ↓
+   Tool Node  Reject Node
+       \       /
+        \     /
+        Tool Result
+            ↓
+         LLM Node
+            ↓
+   Next Tool / Final Answer
 ```
 
-同时加入 Checkpoint：
+工具执行层：
+
+```text
+RAG Tool
+↓
+Knowledge Base
+
+SUMO Tool
+↓
+TraCI
+↓
+SUMO
+```
+
+同时保留 Checkpoint：
 
 ```text
 LangGraph State
@@ -113,6 +132,18 @@ LangGraph State
  Thread ID
       ↓
 保存 / 恢复 Conversation State
+```
+
+其中 Day 8 新增了两个重要边界：
+
+```text
+Memory / State
+≠
+本轮真正发送给 LLM 的 Context
+
+LLM Proposed Action
+≠
+Runtime 已授权执行
 ```
 
 核心职责划分：
@@ -540,7 +571,386 @@ Checkpoint 的职责是恢复 Agent Workflow State，并不应该替代正式科
 
 ---
 
-### 7. Real SUMO Integration
+### 7. Human-in-the-loop
+
+Day 8 在原有 LangGraph Agent Workflow 中加入人工审核机制。
+
+基本流程：
+
+```text
+LLM Proposed Action
+↓
+Runtime / Permission Policy
+↓
+是否需要人工审核？
+├─ No  → 继续执行
+└─ Yes → interrupt()
+          ↓
+        Graph Pause
+          ↓
+        Human Review
+          ↓
+        Command(resume=...)
+          ↓
+        Graph Resume
+```
+
+核心 API：
+
+```python
+interrupt(...)
+```
+
+表示：
+
+```text
+暂停当前 Graph 执行，
+等待外部人工输入。
+```
+
+恢复时：
+
+```python
+Command(resume=value)
+```
+
+人工审核结果会作为之前 `interrupt()` 的返回值继续参与后续路由。
+
+需要特别注意：
+
+> Resume 并不是重新从 `START` 执行整张 Graph。
+
+更准确地说：
+
+```text
+读取相同 thread_id 对应的 checkpoint
+↓
+恢复之前的 Graph State
+↓
+重新进入发生 interrupt 的 Node
+↓
+该 Node 从函数开头重新执行
+↓
+interrupt() 获得 resume value
+↓
+继续执行后续 Graph
+```
+
+因此，`interrupt()` 所在 Node 在恢复时会重新从函数开头执行。
+
+所以真实副作用不应放在：
+
+```text
+副作用
+↓
+interrupt()
+```
+
+之前。
+
+例如 SUMO 应设计为：
+
+```text
+Approval Node
+↓
+interrupt()
+↓
+Human Approve
+↓
+SUMO Tool Node
+```
+
+而不是：
+
+```text
+SUMO Run
+↓
+interrupt()
+```
+
+这样可以避免恢复 Node 时重复执行 SUMO。
+
+---
+
+### 8. Tool Safety / Permission Policy
+
+Day 8 将 Tool 的安全规则从 Agent Workflow 中进一步独立出来。
+
+当前 Policy 使用：
+
+```text
+category
++
+permission
+```
+
+描述一个 Tool。
+
+当前类别示例：
+
+```text
+READ
+COMPUTE
+WRITE
+DESTRUCTIVE
+```
+
+当前权限：
+
+```text
+AUTO
+→ Runtime 可以自动执行
+
+APPROVAL
+→ 必须经过人工审核
+
+DENY
+→ Runtime 直接禁止执行
+```
+
+当前 Tool Policy：
+
+```text
+search_project_knowledge
+→ category = READ
+→ permission = AUTO
+
+run_sumo_experiment
+→ category = COMPUTE
+→ permission = APPROVAL
+
+unknown tool
+→ category = UNKNOWN
+→ permission = DENY
+```
+
+基本流程：
+
+```text
+LLM Tool Call
+↓
+get_tool_policy(tool_name)
+↓
+Permission Router
+├─ AUTO     → Tool Node
+├─ APPROVAL → Approval Node → Human
+└─ DENY     → Denied Tool Node
+```
+
+这里采用：
+
+```text
+Default Deny / Fail Closed
+```
+
+即：
+
+> 一个 Tool 如果没有明确注册安全策略，默认不允许执行。
+
+这样做的主要意义是把：
+
+```text
+Agent Workflow
+```
+
+和：
+
+```text
+Tool Permission Policy
+```
+
+解耦。
+
+新增 Tool 时，不需要在多个 Router 中反复写：
+
+```python
+if tool_name == ...
+elif tool_name == ...
+```
+
+而是主要通过独立的 Policy Registry 配置权限。
+
+但需要注意：
+
+> Permission Policy 只负责“能不能执行、是否需要审核”。
+
+如果要让 LLM 真正能够调用一个新 Tool，仍然需要：
+
+```text
+Tool Schema / TOOLS
+→ 向 LLM 暴露该能力
+
+TOOL_MAP
+→ 将 Tool Name 映射到真实 Python Function
+
+Tool Policy Registry
+→ 定义执行权限
+```
+
+三者职责不同，不能混为一谈。
+
+完整执行边界：
+
+```text
+User Intent
+↓
+LLM Proposal
+↓
+Tool Schema
+↓
+Runtime Validation
+↓
+Permission Policy
+↓
+Human Approval（如需要）
+↓
+Tool Execution
+```
+
+因此：
+
+```text
+LLM 提出 Action
+≠
+Action 合法
+≠
+Action 获准执行
+```
+
+---
+
+### 9. Context Management
+
+Day 8 进一步区分：
+
+```text
+Memory / Persistent State
+```
+
+与：
+
+```text
+LLM Context
+```
+
+二者不是同一个概念。
+
+例如 LangGraph / SQLite 可以保存完整的历史：
+
+```text
+System
+User 1
+Assistant 1
+Tool Call
+Tool Result
+User 2
+Assistant 2
+...
+```
+
+这是：
+
+```text
+Memory / State
+```
+
+但每一次真正调用 LLM 时，不一定需要把所有历史重新发送。
+
+当前教学版 Context Manager：
+
+```text
+完整 messages
+↓
+build_llm_context()
+↓
+保留 System Prompt
++
+最近 N 条非 System 消息
+↓
+发送给 LLM
+```
+
+因此：
+
+```text
+Full State Messages
+≠
+LLM Context Messages
+```
+
+例如测试：
+
+```text
+Full message count = 9
+LLM context count = 5
+```
+
+说明完整 State 仍有 9 条消息，但真正送给 LLM 的只有：
+
+```text
+System
++
+最近 4 条消息
+```
+
+这样可以缓解：
+
+```text
+Conversation 越长
+↓
+Input Tokens 越多
+↓
+成本增加
++
+延迟增加
++
+Context Window 压力增加
+```
+
+当前 Context Trimming 只是教学版，按消息数量截取。
+
+正式 Tool Agent 还需要保证：
+
+```text
+Assistant Tool Call
++
+对应 Tool Result
+```
+
+不会被裁剪拆开。
+
+未来可以进一步扩展：
+
+```text
+Token-based Trimming
+Conversation Summary
+Structured State
+Experiment Result Storage
+```
+
+推荐的状态分层：
+
+```text
+Conversation Messages
+→ 语言上下文
+
+Structured State
+→ scenario / seed / current_stage / experiment_results
+
+Checkpoint
+→ Workflow 恢复
+
+Experiment Storage
+→ 正式科研结果
+```
+
+因此：
+
+> Memory 负责“保存了什么”，Context Manager 负责“这一轮让 LLM 看什么”。
+
+---
+
+### 10. Real SUMO Integration
 
 已实现：
 
@@ -886,6 +1296,15 @@ traffic-simulation-agent/
 │   ├── day07_traffic_agent_memory.py
 │   └── day07_traffic_agent_sqlite.py
 │
+├── day08/
+│   ├── __init__.py
+│   ├── day08_human_interrupt_basic.py
+│   ├── day08_traffic_agent_approval.py
+│   ├── day08_tool_policy.py
+│   ├── day08_traffic_agent_policy.py
+│   ├── day08_context_management.py
+│   └── day08_traffic_agent_context.py
+│
 ├── knowledge/
 │   ├── metrics.md
 │   ├── scenarios.md
@@ -954,6 +1373,52 @@ thread_id
 ```
 
 程序退出后，可通过同一个 `thread_id` 恢复之前的 Conversation State。
+
+
+### Day 8：Human Approval
+
+```powershell
+python -m day08.day08_traffic_agent_approval
+```
+
+验证：
+
+```text
+RAG Tool
+→ 自动执行
+
+SUMO Tool
+→ interrupt
+→ Human Approve / Reject
+```
+
+### Day 8：Permission Policy
+
+```powershell
+python -m day08.day08_traffic_agent_policy
+```
+
+验证：
+
+```text
+READ / AUTO
+COMPUTE / APPROVAL
+UNKNOWN / DENY
+```
+
+### Day 8：Context Management
+
+基础测试：
+
+```powershell
+python -m day08.day08_context_management
+```
+
+接入真实 Agent：
+
+```powershell
+python -m day08.day08_traffic_agent_context
+```
 
 示例知识问题：
 
@@ -1069,7 +1534,9 @@ SUMO 1.27.1
 - [x] Thread-scoped Conversation State
 - [x] SQLite Persistent Checkpoint
 - [ ] Long-term Memory
-- [ ] Context / Message Management
+- [x] Human-in-the-loop
+- [x] Tool Permission Policy
+- [x] Context / Message Management
 - [ ] Experiment Memory
 - [ ] Scenario Modification Tools
 - [ ] Automatic Experiment Comparison
@@ -1137,9 +1604,209 @@ Retry / Continue / End
 
 ---
 
+
+### Day 8：Human-in-the-loop、Tool Safety 与 Context Management
+
+Day 8 的核心是在 Day 7 的 LangGraph Workflow 之上继续增加：
+
+```text
+人工审核
++
+执行权限边界
++
+上下文管理
+```
+
+#### 1. Human-in-the-loop
+
+原有流程：
+
+```text
+LLM
+↓
+Runtime Validation
+↓
+Tool Execution
+```
+
+加入人工审核后：
+
+```text
+LLM
+↓
+Runtime Validation
+↓
+Permission Policy
+↓
+需要审核？
+├─ No  → Tool Execution
+└─ Yes → interrupt()
+          ↓
+        Human
+          ↓
+        Command(resume=...)
+          ↓
+        Continue
+```
+
+一个容易混淆的点：
+
+```text
+Resume
+≠
+重新从 START 执行整张 Graph
+```
+
+更准确的是：
+
+```text
+Checkpoint 恢复之前的 State
+↓
+重新进入 interrupt 所在 Node
+↓
+该 Node 从函数开头重新执行
+↓
+interrupt 获得人工 resume value
+↓
+继续后续路径
+```
+
+所以这里不是“创建一个全新的 State”，而是：
+
+> 恢复 checkpoint 中已有的 Graph State，并用人工输入补充本次恢复所需要的 resume value。
+
+#### 2. Tool Policy
+
+之前如果把权限逻辑直接写在 Agent Router：
+
+```python
+if tool_name == "run_sumo_experiment":
+    ...
+```
+
+随着 Tool 越来越多，会变得难以维护。
+
+Day 8 将 Tool Policy 单独放在：
+
+```text
+day08_tool_policy.py
+```
+
+通过：
+
+```python
+get_tool_policy(tool_name)
+```
+
+统一获得：
+
+```text
+category
+permission
+reason
+```
+
+这样 Agent Workflow 只关心：
+
+```text
+AUTO
+APPROVAL
+DENY
+```
+
+而不需要到处判断具体 Tool 名字。
+
+需要特别记住：
+
+```text
+Tool Schema
+→ LLM 知道有哪些 Tool
+
+TOOL_MAP
+→ Python 知道 Tool Name 对应哪个真实函数
+
+Tool Policy
+→ Runtime 知道 Tool 是否允许执行
+```
+
+所以增加新 Tool 时，Policy 可以避免反复修改权限路由逻辑，但并不意味着 `TOOLS / Tool Schema` 和 `TOOL_MAP` 永远不需要更新。
+
+#### 3. Memory ≠ Context
+
+Day 8 另一个重要认识：
+
+```text
+Memory
+≠
+Context
+```
+
+Memory / State 可以保存完整历史：
+
+```text
+全部 User
+全部 Assistant
+Tool Calls
+Tool Results
+```
+
+但是 LLM 每轮不一定需要读取全部历史。
+
+因此引入：
+
+```text
+Context Manager
+```
+
+当前流程：
+
+```text
+完整 State messages
+↓
+build_llm_context()
+↓
+System Prompt
++
+最近 N 条消息
+↓
+LLM
+```
+
+所以：
+
+```text
+保存多少
+≠
+每轮发送多少
+```
+
+这意味着以后可以同时拥有：
+
+```text
+完整持久化 Memory
++
+受控的 LLM Context
+```
+
+从而减少无关历史对 Token、延迟和 Context Window 的压力。
+
+当前按消息数量裁剪只是教学实现。
+
+正式 Tool Agent 后续还需要处理：
+
+```text
+Tool Call / Tool Result 成对完整性
+Token-based Trimming
+Conversation Summary
+Structured State
+```
+
+---
+
+
 ### Agent 职责划分
 
-> LLM 负责理解、决策和工具选择；Agent Runtime 负责循环、校验、异常处理和执行控制；RAG 提供项目知识；Tools 负责真正完成确定性的外部任务。
+> LLM 负责理解、决策和提出 Action；Agent Runtime 负责流程编排、Validation、异常处理与执行控制；Permission Policy 决定 Tool 的权限边界；Human-in-the-loop 对需要审批的 Action 给出最终审核结果；RAG 提供项目知识；Tools 负责真正完成确定性的外部任务。
 
 ---
 
@@ -1197,6 +1864,29 @@ Runtime Validation
 ```
 
 LLM 可以理解动态条件，但涉及确定数值判断和执行权限时，应尽可能由 Runtime 控制。
+
+
+Day 8 进一步扩展为：
+
+```text
+LLM提出 Action
+↓
+Runtime Validation
+↓
+Permission Policy
+↓
+Human Approval（如需要）
+↓
+Tool Execution
+```
+
+因此：
+
+```text
+Valid
+≠
+Approved
+```
 
 ---
 
